@@ -7,6 +7,7 @@ its typical price (H+L+C)/3, then calculates POC and a 70% value area.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -16,18 +17,35 @@ from fastmcp import FastMCP
 async def _fetch_daily_bars(
     client: httpx.AsyncClient, symbol: str, lookback: int, feed: str | None
 ) -> dict[str, Any]:
-    # IEX is the safe default for Alpaca paper/free market-data access.
+    """Fetch enough calendar days to obtain the requested daily bars.
+
+    The Alpaca historical-bars API defaults ``start`` to the beginning of the
+    current day when it is omitted. On weekends/holidays that produces an
+    empty result, even for valid symbols. FVP needs an explicit historical
+    range based on the requested lookback.
+
+    The single-symbol endpoint is used deliberately because its response is
+    always ``{"bars": [...]}``, avoiding the multi-symbol response shape
+    ``{"bars": {"AAPL": [...]}}``.
+    """
     selected_feed = (feed or "iex").strip().lower()
+    # Daily bars occur only on trading days. Two calendar days per requested
+    # bar gives comfortable room for weekends and market holidays.
+    calendar_days = max(int(lookback) * 2, int(lookback) + 10)
+    start = datetime.now(timezone.utc) - timedelta(days=calendar_days)
+    start_iso = start.strftime("%Y-%m-%dT%H:%M:%SZ")
     params = {
-        "symbols": symbol.upper().strip(),
         "timeframe": "1Day",
+        "start": start_iso,
         "limit": min(max(int(lookback), 10), 1000),
         "sort": "asc",
         "adjustment": "raw",
         "feed": selected_feed,
     }
     try:
-        response = await client.get("/v2/stocks/bars", params=params)
+        response = await client.get(
+            f"/v2/stocks/{symbol.upper().strip()}/bars", params=params
+        )
         if response.is_error:
             try:
                 detail = response.json()
@@ -39,20 +57,41 @@ async def _fetch_daily_bars(
                     "http_status": response.status_code,
                     "detail": detail,
                     "feed_used": selected_feed,
+                    "request_start": start_iso,
                 }
             }
         try:
-            return response.json()
+            data = response.json()
         except ValueError:
             return {
                 "error": {
                     "message": "Alpaca returned a non-JSON response",
                     "http_status": response.status_code,
                     "feed_used": selected_feed,
+                    "request_start": start_iso,
                 }
             }
+
+        # Single-symbol endpoint returns a list. Keep a defensive fallback for
+        # the multi-symbol shape in case an upstream proxy changes the route.
+        bars = data.get("bars", []) if isinstance(data, dict) else []
+        if isinstance(bars, dict):
+            bars = bars.get(symbol.upper().strip(), [])
+        if not isinstance(bars, list):
+            bars = []
+        return {
+            "bars": bars,
+            "feed_used": selected_feed,
+            "request_start": start_iso,
+        }
     except httpx.HTTPError as exc:
-        return {"error": {"message": f"Market data request failed: {exc}"}}
+        return {
+            "error": {
+                "message": f"Market data request failed: {exc}",
+                "feed_used": selected_feed,
+                "request_start": start_iso,
+            }
+        }
 
 
 def _profile(bars: list[dict[str, Any]], bins: int) -> dict[str, Any]:
@@ -190,25 +229,20 @@ def register_fvp_tool(server: FastMCP, client: httpx.AsyncClient) -> None:
         if "error" in data:
             return data
 
-        bars_by_symbol = data.get("bars", {})
-        bars = bars_by_symbol.get(symbol_clean, [])
-        if not bars:
-            # Be tolerant of an unexpected key casing from an upstream response.
-            for key, value in bars_by_symbol.items():
-                if str(key).upper() == symbol_clean:
-                    bars = value
-                    break
-
+        bars = data.get("bars", [])
         result = _profile(bars, bins)
         if "error" in result:
             result["symbol"] = symbol_clean
-            result["feed"] = (feed or "iex").strip().lower()
+            result["feed"] = data.get("feed_used", (feed or "iex").strip().lower())
+            result["request_start"] = data.get("request_start")
+            result["bars_received"] = len(bars) if isinstance(bars, list) else 0
             return result
 
         result["symbol"] = symbol_clean
         result["timeframe"] = "1Day"
-        result["feed"] = (feed or "iex").strip().lower()
+        result["feed"] = data.get("feed_used", (feed or "iex").strip().lower())
         result["method"] = "Typical-price allocation from daily OHLCV; 70% value area"
         result["lookback_requested"] = lookback
         result["bins_requested"] = bins
+        result["request_start"] = data.get("request_start")
         return result
