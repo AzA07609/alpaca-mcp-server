@@ -16,13 +16,15 @@ from fastmcp import FastMCP
 async def _fetch_daily_bars(
     client: httpx.AsyncClient, symbol: str, lookback: int, feed: str | None
 ) -> dict[str, Any]:
+    # IEX is the safe default for Alpaca paper/free market-data access.
+    selected_feed = (feed or "iex").strip().lower()
     params = {
         "symbols": symbol.upper().strip(),
         "timeframe": "1Day",
-        "limit": min(max(lookback, 10), 1000),
+        "limit": min(max(int(lookback), 10), 1000),
         "sort": "asc",
         "adjustment": "raw",
-        "feed": feed,
+        "feed": selected_feed,
     }
     try:
         response = await client.get("/v2/stocks/bars", params=params)
@@ -31,8 +33,24 @@ async def _fetch_daily_bars(
                 detail = response.json()
             except Exception:
                 detail = response.text
-            return {"error": {"http_status": response.status_code, "detail": detail}}
-        return response.json()
+            return {
+                "error": {
+                    "message": "Alpaca market data request failed",
+                    "http_status": response.status_code,
+                    "detail": detail,
+                    "feed_used": selected_feed,
+                }
+            }
+        try:
+            return response.json()
+        except ValueError:
+            return {
+                "error": {
+                    "message": "Alpaca returned a non-JSON response",
+                    "http_status": response.status_code,
+                    "feed_used": selected_feed,
+                }
+            }
     except httpx.HTTPError as exc:
         return {"error": {"message": f"Market data request failed: {exc}"}}
 
@@ -63,14 +81,15 @@ def _profile(bars: list[dict[str, Any]], bins: int) -> dict[str, Any]:
             "poc": low,
             "vah": high,
             "val": low,
+            "value_area_percent": 70,
             "profile": [{"price": low, "volume": sum(b["volume"] for b in cleaned)}],
         }
 
-    bin_count = min(max(bins, 12), 100)
+    bin_count = min(max(int(bins), 12), 100)
     step = (high - low) / bin_count
     volumes = [0.0] * bin_count
 
-    # Daily OHLCV does not contain the intraday volume-at-price distribution.
+    # Daily OHLCV does not contain intraday volume-at-price distribution.
     # Use the typical price (H+L+C)/3 as a deterministic approximation.
     for bar in cleaned:
         typical = (bar["high"] + bar["low"] + bar["close"]) / 3.0
@@ -153,23 +172,42 @@ def register_fvp_tool(server: FastMCP, client: httpx.AsyncClient) -> None:
             symbol: Stock ticker, e.g. NVDA or AAPL.
             lookback: Number of recent daily bars in the fixed range. Default 60.
             bins: Price bins used for the profile. Default 48.
-            feed: Alpaca stock feed, e.g. "iex" for free/paper access.
+            feed: Alpaca stock feed. Defaults to "iex" for paper/free access.
 
         Returns POC, VAH, VAL, range, high-volume nodes and the profile.
         This is a daily OHLCV approximation, not an exact TradingView clone.
         The tool is read-only and never places orders.
         """
-        if not symbol.strip():
+        symbol_clean = symbol.upper().strip()
+        if not symbol_clean:
             return {"error": {"message": "symbol is required"}}
-        data = await _fetch_daily_bars(client, symbol, lookback, feed)
+        if lookback < 10:
+            return {"error": {"message": "lookback must be at least 10 daily bars"}}
+        if bins < 12:
+            return {"error": {"message": "bins must be at least 12"}}
+
+        data = await _fetch_daily_bars(client, symbol_clean, lookback, feed)
         if "error" in data:
             return data
-        bars = data.get("bars", {}).get(symbol.upper().strip(), [])
+
+        bars_by_symbol = data.get("bars", {})
+        bars = bars_by_symbol.get(symbol_clean, [])
+        if not bars:
+            # Be tolerant of an unexpected key casing from an upstream response.
+            for key, value in bars_by_symbol.items():
+                if str(key).upper() == symbol_clean:
+                    bars = value
+                    break
+
         result = _profile(bars, bins)
         if "error" in result:
+            result["symbol"] = symbol_clean
+            result["feed"] = (feed or "iex").strip().lower()
             return result
-        result["symbol"] = symbol.upper().strip()
+
+        result["symbol"] = symbol_clean
         result["timeframe"] = "1Day"
+        result["feed"] = (feed or "iex").strip().lower()
         result["method"] = "Typical-price allocation from daily OHLCV; 70% value area"
         result["lookback_requested"] = lookback
         result["bins_requested"] = bins
