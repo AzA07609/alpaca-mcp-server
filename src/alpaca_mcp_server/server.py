@@ -22,6 +22,7 @@ from fastmcp.server.providers.openapi.routing import MCPType
 from .fvp import register_fvp_tool
 from .readme_docs import ReadMeClientFactory, register_readme_docs_tools
 from .security import TrustBoundaryMiddleware
+from .strategy_analysis import register_strategy_analysis_tool
 from .tool_registry import TOOL_DESCRIPTIONS, TOOL_NAMES
 from .toolsets import OVERRIDE_OPERATION_IDS, TOOLSETS, get_active_operations
 
@@ -210,6 +211,7 @@ def build_server(
     if data_client is not None and active_ts & {"stock-data", "crypto-data"}:
         _register_market_data_overrides(main, data_client)
         register_fvp_tool(main, data_client)
+        register_strategy_analysis_tool(main, data_client)
 
     register_readme_docs_tools(main, client_factory=readme_client_factory)
 
