@@ -20,14 +20,17 @@ async def _fetch_daily_bars(
     client: httpx.AsyncClient, symbol: str, lookback: int, feed: str | None
 ) -> dict[str, Any]:
     selected_feed = (feed or "iex").strip().lower()
-    calendar_days = max(int(lookback) * 2, int(lookback) + 10)
+    # Use a sufficiently wide calendar window, then request the MOST RECENT
+    # `lookback` bars with descending sort. The previous implementation used
+    # sort=asc + limit=lookback, which returned the oldest bars in the window.
+    calendar_days = max(int(lookback) * 3, int(lookback) + 30)
     start = datetime.now(timezone.utc) - timedelta(days=calendar_days)
     start_iso = start.strftime("%Y-%m-%dT%H:%M:%SZ")
     params = {
         "timeframe": "1Day",
         "start": start_iso,
         "limit": min(max(int(lookback), 10), 1000),
-        "sort": "asc",
+        "sort": "desc",
         "adjustment": "raw",
         "feed": selected_feed,
     }
@@ -46,6 +49,7 @@ async def _fetch_daily_bars(
                 feed_used=selected_feed,
                 request_path=path,
                 request_start=start_iso,
+                request_sort="desc",
             )
         try:
             data = response.json()
@@ -56,17 +60,21 @@ async def _fetch_daily_bars(
                 feed_used=selected_feed,
                 request_path=path,
                 request_start=start_iso,
+                request_sort="desc",
             )
         bars = data.get("bars", []) if isinstance(data, dict) else []
         if isinstance(bars, dict):
             bars = bars.get(symbol.upper().strip(), [])
         if not isinstance(bars, list):
             bars = []
+        # Return chronological order to all downstream indicator/profile code.
+        bars.reverse()
         return {
             "bars": bars,
             "feed_used": selected_feed,
             "request_path": path,
             "request_start": start_iso,
+            "request_sort": "desc_then_reverse_to_asc",
             "raw_keys": list(data.keys()) if isinstance(data, dict) else [],
         }
     except Exception as exc:
@@ -78,6 +86,7 @@ async def _fetch_daily_bars(
             feed_used=selected_feed,
             request_path=path,
             request_start=start_iso,
+            request_sort="desc",
         )
 
 
@@ -224,7 +233,7 @@ def register_fvp_tool(server: FastMCP, client: httpx.AsyncClient) -> None:
         bins: int = 48,
         feed: str | None = None,
     ) -> dict[str, Any]:
-        """Calculate a fixed-range volume profile from daily stock bars."""
+        """Calculate a fixed-range volume profile from the most recent daily stock bars."""
         try:
             symbol_clean = symbol.upper().strip()
             if not symbol_clean:
@@ -245,6 +254,7 @@ def register_fvp_tool(server: FastMCP, client: httpx.AsyncClient) -> None:
                 result["feed"] = data.get("feed_used")
                 result["request_path"] = data.get("request_path")
                 result["request_start"] = data.get("request_start")
+                result["request_sort"] = data.get("request_sort")
                 result["bars_received"] = len(bars) if isinstance(bars, list) else 0
                 result["raw_keys"] = data.get("raw_keys", [])
                 return result
@@ -257,6 +267,9 @@ def register_fvp_tool(server: FastMCP, client: httpx.AsyncClient) -> None:
             result["bins_requested"] = bins
             result["request_path"] = data.get("request_path")
             result["request_start"] = data.get("request_start")
+            result["request_sort"] = data.get("request_sort")
+            result["first_bar_date"] = bars[0].get("t") if bars else None
+            result["last_bar_date"] = bars[-1].get("t") if bars else None
             return result
         except Exception as exc:
             return _error(
