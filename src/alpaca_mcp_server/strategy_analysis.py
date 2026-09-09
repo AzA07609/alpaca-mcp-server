@@ -199,27 +199,42 @@ def register_strategy_analysis_tool(server: FastMCP, client: httpx.AsyncClient) 
             symbol = symbol.upper().strip()
             if not symbol:
                 return {"error": {"message": "symbol is required"}}
+
+            # Daily helper now returns the most recent bars in chronological order.
             daily_data = await _fetch_daily_bars(client, symbol, daily_lookback, feed)
             if "error" in daily_data:
                 return daily_data
-            weekly_data = await _fetch_daily_bars(client, symbol, weekly_lookback, feed)
-            if "error" in weekly_data:
-                return weekly_data
             daily_bars = daily_data.get("bars", [])
-            weekly_bars = weekly_data.get("bars", [])
-            if len(daily_bars) < 200 or len(weekly_bars) < 200:
-                return {"error": {"message": "At least 200 daily and 200 weekly bars are required for SMA200.", "daily_bars": len(daily_bars), "weekly_bars": len(weekly_bars)}}
-            # The endpoint's timeframe is daily; fetch weekly bars through the same client directly.
+            if len(daily_bars) < 200:
+                return {"error": {"message": "At least 200 daily bars are required for SMA200.", "daily_bars": len(daily_bars)}}
+
+            # Weekly endpoint: request from a broad historical start, but use
+            # descending order so `limit` selects the LATEST weekly bars.
             path = f"/v2/stocks/{symbol}/bars"
-            response = await client.get(path, params={"timeframe": "1Week", "start": "2021-01-01T00:00:00Z", "limit": min(max(int(weekly_lookback), 200), 1000), "sort": "asc", "adjustment": "raw", "feed": (feed or "iex").strip().lower()})
+            response = await client.get(
+                path,
+                params={
+                    "timeframe": "1Week",
+                    "start": "2021-01-01T00:00:00Z",
+                    "limit": min(max(int(weekly_lookback), 200), 1000),
+                    "sort": "desc",
+                    "adjustment": "raw",
+                    "feed": (feed or "iex").strip().lower(),
+                },
+            )
             response.raise_for_status()
             weekly_json = response.json()
             weekly_bars = weekly_json.get("bars", []) if isinstance(weekly_json, dict) else []
+            if not isinstance(weekly_bars, list):
+                weekly_bars = []
+            weekly_bars.reverse()
             if len(weekly_bars) < 200:
                 return {"error": {"message": "Not enough weekly bars for SMA200", "weekly_bars": len(weekly_bars)}}
+
             daily = _latest_daily_indicators(daily_bars)
             weekly = _weekly_trend(weekly_bars)
-            fvp = _profile(daily_bars[-min(daily_lookback, len(daily_bars)):], bins)
+            # FVP is a TFD location layer: use the same latest daily window.
+            fvp = _profile(daily_bars[-min(60, len(daily_bars)):], bins)
             if "error" in fvp:
                 return fvp
             decision = _decision(weekly, daily, fvp)
@@ -232,8 +247,16 @@ def register_strategy_analysis_tool(server: FastMCP, client: httpx.AsyncClient) 
                 "TFD": {k: _round(v) for k, v in daily.items()},
                 "FVP": {k: _round(v) for k, v in fvp.items() if k != "profile"},
                 "FVP_high_volume_nodes": fvp.get("high_volume_nodes", []),
-                "method": "Daily OHLCV typical-price allocation; 70% value area; read-only.",
-                "data": {"daily_bars": len(daily_bars), "weekly_bars": len(weekly_bars), "feed": (feed or "iex").strip().lower()},
+                "method": "Daily OHLCV typical-price allocation; latest 60 daily bars; 70% value area; read-only.",
+                "data": {
+                    "daily_bars": len(daily_bars),
+                    "weekly_bars": len(weekly_bars),
+                    "daily_first_bar": daily_bars[0].get("t") if daily_bars else None,
+                    "daily_last_bar": daily_bars[-1].get("t") if daily_bars else None,
+                    "weekly_first_bar": weekly_bars[0].get("t") if weekly_bars else None,
+                    "weekly_last_bar": weekly_bars[-1].get("t") if weekly_bars else None,
+                    "feed": (feed or "iex").strip().lower(),
+                },
             }
         except Exception as exc:
             return {"error": {"message": "Strategy analysis failed", "error_type": type(exc).__name__, "error_message": str(exc), "traceback": traceback.format_exc(limit=12)}}
